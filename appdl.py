@@ -29,10 +29,16 @@ from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, LSTM, Embedding, Concatenate
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.preprocessing.image import img_to_array, load_img
+from tensorflow.keras.preprocessing.image import load_img
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import precision_score, recall_score, f1_score, mean_absolute_error, mean_squared_error
+import logging
+import requests
+from io import BytesIO
+from PIL import Image
 
+logging.basicConfig(level=logging.INFO)
 
 # Disable eager execution
 tf.compat.v1.disable_eager_execution()
@@ -40,8 +46,8 @@ tf.compat.v1.disable_eager_execution()
 FLAGS = flags.FLAGS
 
 
-flags.DEFINE_string('train_label', 'MSDS24/data/label/train_no_dup.json', 'Training label file')
-flags.DEFINE_string('test_label', 'MSDS24/data/label/test_no_dup.json', 'Testing label file')
+flags.DEFINE_string('train_label', 'data/label/train_no_dup.json', 'Training label file')
+flags.DEFINE_string('test_label', 'data/label/test_no_dup.json', 'Testing label file')
 flags.DEFINE_string('valid_label','data/label/valid_no_dup.json', 'Validation label file')
 flags.DEFINE_string('output_directory', 'data/tf_records/', 'Output data directory')
 flags.DEFINE_string('image_dir', 'data/images/', 'Directory of image patches')
@@ -95,7 +101,7 @@ def _float_feature(value):
 
 def _bytes_feature(value):
     """Wrapper for inserting bytes features into Example proto."""
-    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[tf.compat.as_bytes(value)]))
+    return tf.train.Feature(bytes_list=tf.train.BytesList(value=[tf.compat.v1.compat.as_bytes(value)]))
 
 def _int64_feature_list(values):
     """Wrapper for inserting an int64 FeatureList into a SequenceExample proto."""
@@ -120,26 +126,54 @@ def _to_sequence_example(set_info, decoder, vocab):
     image_ids = []
     caption_data = []
     caption_ids = []
+    # Prepare the data
+    images = []
+    texts = []
+    likes = []
 
     for image_info in set_info['items']:
         filename = os.path.join(FLAGS.image_dir, set_id, str(image_info['index']) + '.jpg')
+        if not os.path.exists(filename):
+            logging.warning("File not found: %s", filename)
+            continue
+
         with open(filename, "rb") as f:
             encoded_image = f.read()
 
         try:
             decoded_image = decoder.decode_jpeg(encoded_image)
         except (tf.errors.InvalidArgumentError, AssertionError):
-            print("Skipping file with invalid JPEG data: %s" % filename)
-            return
-
+            logging.warning("Skipping file with invalid JPEG data: %s", filename)
+            continue
+        
+        # Prepare the data
+        image = preprocess_image(encoded_image, target_size=(IMG_HEIGHT, IMG_WIDTH))
+        images.append(image)
+        texts.append(set_info['desc'])
+        likes.append(set_info['likes'])
         image_data.append(encoded_image)
         image_ids.append(image_info['index'])
 
+        images = np.array(images)
+        likes = np.array(likes)
+
+        # Tokenize the text data
+        tokenizer = Tokenizer(num_words=vocab_size)
+        tokenizer.fit_on_texts(texts)
+        text_sequences = tokenizer.texts_to_sequences(texts)
+        text_sequences = pad_sequences(text_sequences, maxlen=SEQ_LENGTH)
+
         # Ensure caption is decoded to a string
-        caption = image_info['name'].decode('utf-8') if isinstance(image_info['name'], bytes) else image_info['name']
+        caption = image_info['name']
+        if isinstance(caption, bytes):
+            caption = caption.decode('utf-8')
         caption_data.append(caption.encode('utf-8'))
         caption_id = [vocab.word_to_id(word) + 1 for word in caption.split()]
         caption_ids.append(caption_id)
+
+    if not image_data:
+        logging.warning("No valid images found for set: %s", set_id)
+        return None
 
     feature = {}
     # Only keep 8 images, if outfit has less than 8 items, repeat the last one.
@@ -148,7 +182,7 @@ def _to_sequence_example(set_info, decoder, vocab):
             feature['images/' + str(index)] = _bytes_feature(image_data[-1])
         else:
             feature['images/' + str(index)] = _bytes_feature(image_data[index])
-        
+
     feature["set_id"] = _bytes_feature(set_id.encode('utf-8'))
     feature["set_url"] = _bytes_feature(set_info['set_url'].encode('utf-8'))
     # Likes and Views are not used in our model, but we put it into TFRecords.
@@ -194,11 +228,7 @@ class ImageCoder(object):
         return image
 
 def _process_image_files_batch(coder, thread_index, ranges, name, all_sets, vocab, num_shards):
-    """Processes and saves list of images as TFRecord in 1 thread.
-    """
-    # Each thread produces N shards where N = int(num_shards / num_threads).
-    # For instance, if num_shards = 128, and the num_threads = 2, then the first
-    # thread would produce shards [0, 64).
+    """Processes and saves list of images as TFRecord in 1 thread."""
     num_threads = len(ranges)
     assert not num_shards % num_threads
     num_shards_per_batch = int(num_shards / num_threads)
@@ -208,7 +238,6 @@ def _process_image_files_batch(coder, thread_index, ranges, name, all_sets, voca
 
     counter = 0
     for s in range(num_shards_per_batch):
-        # Generate a sharded version of the file name, e.g. 'train-00002-of-00010'
         shard = thread_index * num_shards_per_batch + s
         output_filename = '%s-%.5d-of-%.5d' % (name, shard, num_shards)
         output_file = os.path.join(FLAGS.output_directory, output_filename)
@@ -219,38 +248,42 @@ def _process_image_files_batch(coder, thread_index, ranges, name, all_sets, voca
         for i in files_in_shard:
             sequence_example = _to_sequence_example(all_sets[i], coder, vocab)
             if not sequence_example:
-                print('fail for set: ' + all_sets[i]['set_id'])
+                logging.warning('Failed for set: %s', all_sets[i]['set_id'])
                 continue
             writer.write(sequence_example.SerializeToString())
             shard_counter += 1
             counter += 1
 
             if not counter % 100:
-                print('%s [thread %d]: Processed %d of %d images in thread batch.' %
-                      (datetime.now(), thread_index, counter, num_files_in_thread))
-                sys.stdout.flush()
+                logging.info('%s [thread %d]: Processed %d of %d images in thread batch.',
+                             datetime.now(), thread_index, counter, num_files_in_thread)
 
         writer.close()
-        print('%s [thread %d]: Wrote %d images to %s' %
-              (datetime.now(), thread_index, shard_counter, output_file))
-        sys.stdout.flush()
+        logging.info('%s [thread %d]: Wrote %d images to %s',
+                     datetime.now(), thread_index, shard_counter, output_file)
         shard_counter = 0
-    print('%s [thread %d]: Wrote %d images to %d shards.' %
-          (datetime.now(), thread_index, counter, num_files_in_thread))
-    sys.stdout.flush()
+    logging.info('%s [thread %d]: Wrote %d images to %d shards.',
+                 datetime.now(), thread_index, counter, num_files_in_thread)
+
 
 def _process_image_files(name, all_sets, vocab, num_shards):
-    """Process and save list of images as TFRecord of Example protos.
     """
-    # Break all images into batches with a [ranges[i][0], ranges[i][1]].
+    Process and save list of images as TFRecord of Example protos.
+    
+    Args:
+        name (str): Unique identifier specifying the data set.
+        all_sets (list): List of all image sets.
+        vocab (Vocabulary): Vocabulary object for processing captions.
+        num_shards (int): Number of shards for this data set.
+    """
+    # Break all images into batches with a [ranges[i][0], ranges[i+1]].
     spacing = np.linspace(0, len(all_sets), FLAGS.num_threads + 1).astype(int)
     ranges = []
     for i in range(len(spacing) - 1):
-        ranges.append([spacing[i], spacing[i+1]])
+        ranges.append([spacing[i], spacing[i + 1]])
 
     # Launch a thread for each batch.
-    print('Launching %d threads for spacings: %s' % (FLAGS.num_threads, ranges))
-    sys.stdout.flush()
+    logging.info('Launching %d threads for spacings: %s', FLAGS.num_threads, ranges)
 
     # Create a mechanism for monitoring when all threads are finished.
     coord = tf.train.Coordinator()
@@ -267,9 +300,7 @@ def _process_image_files(name, all_sets, vocab, num_shards):
 
     # Wait for all the threads to terminate.
     coord.join(threads)
-    print('%s: Finished writing all %d fashion sets in data set.' %
-          (datetime.now(), len(all_sets)))
-    sys.stdout.flush()
+    logging.info('%s: Finished writing all %d fashion sets in data set.', datetime.now(), len(all_sets))
 
 def _create_vocab(filename):
     """Creates the vocabulary of word to word_id.
@@ -503,6 +534,26 @@ def reindex_data(cf_data, cb_data):
     return cf_data, cb_data
 
 
+## adding DL
+# Define image dimensions and text sequence length
+IMG_HEIGHT, IMG_WIDTH = 128, 128
+SEQ_LENGTH = 100
+vocab_size = 10000  # Adjust based on your vocabulary size
+
+# Load and preprocess the image
+def preprocess_image(image_url, target_size):
+    response = requests.get(image_url)
+    image = Image.open(BytesIO(response.content))
+    image = image.resize(target_size)
+    image = img_to_array(image)
+    image = image / 255.0  # Normalize to [0, 1]
+    return image
+
+# Preprocess the text
+def preprocess_text(text, tokenizer, max_length):
+    sequences = tokenizer.texts_to_sequences([text])
+    padded_sequences = pad_sequences(sequences, maxlen=max_length)
+    return padded_sequences
 
 
 
@@ -523,10 +574,10 @@ def main(_argv):
 
     print('Vocab file %s' % vocab.word_to_id('famous'))
     # Run it!
-    #_process_dataset('valid-no-dup', FLAGS.valid_label, vocab, FLAGS.valid_shards)
+    _process_dataset('valid-no-dup', FLAGS.valid_label, vocab, FLAGS.valid_shards)
     #_process_dataset('test-no-dup', FLAGS.test_label, vocab, FLAGS.test_shards)
     #_process_dataset('train-no-dup', FLAGS.train_label, vocab, FLAGS.train_shards)
-    _read_dataset('valid-no-dup', FLAGS.valid_label, vocab)
+    #_read_dataset('valid-no-dup', FLAGS.valid_label, vocab)
 
 if __name__ == '__main__':
     app.run(main)
